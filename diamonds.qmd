@@ -1,0 +1,285 @@
+---
+title: "Predicting price of `diamonds`"
+subtitle: "Business Analytics (23/24)"
+format: 
+  html:
+    fig-width: 8
+    fig-height: 4
+    embed-resources: true
+    code-fold: true
+    standalone: true
+    toc: true
+    toc-location: left
+    toc-depth: 2
+    number-sections: true
+---
+
+In this document, we will perform a numeric prediction job using the `diamonds` dataset from `ggplot2`. As `ggplot2` is included in tidymodels, we will need only the `tidymodels` package.
+
+```{r, message=FALSE}
+library(tidymodels)
+```
+
+# The `diamonds` Dataset
+
+The dataset contains the prices and other attributes of almost 54,000 diamonds.
+
+```{r}
+data("diamonds")
+diamonds
+```
+
+## The target variable
+
+Our job will be predicting the `price` variable, thus it is a regression or numerical prediction job. It is always a good idea to examine the target variable.
+
+```{r}
+diamonds |>
+  ggplot(aes(price)) +
+  geom_histogram(bins = 20) +
+  theme_minimal()
+```
+
+We can see that the variable is highly **right-skewed**, meaning that there are many samples with a price higher than the expected if the variable followed a normal law.
+
+In those cases, it is a good idea to use the **logarithm** of the variable as a predictor. The transformations of the target variable must be done outside the prediction workflow, so we define `log_price` as:
+
+```{r}
+diamonds <- diamonds |>
+  mutate(log_price = log(price))
+```
+
+The distribution of `log_price` is:
+
+```{r}
+diamonds |>
+  ggplot(aes(log_price)) +
+  geom_histogram(bins = 20) +
+  theme_minimal()
+```
+
+We observe that `log_price` has a more adequate distribution for predictive modelling.
+
+## The Features
+
+The features of the dataset are some diamond properties. Features from cut to clarity are set as **ordered factors**, meaning that factor levels are ordinal variables. This means that we can turn them into ordinal variables, rather than a set of dummies.
+
+The other features are numeric, and have to do with diamond size. `carat` is a measure of diamond weight, and `x`,`y`, `z`, `depth` and `table` are measures of diamond size.
+
+As larger diamonds will also be larger, it is not surprising to find high values of correlation between those variables. Let's use the `corrr` package to see them.
+
+```{r, message=FALSE}
+library(corrr)
+diamonds |>
+  select(where(is.numeric)) |>
+  correlate() |>
+  rearrange() |>
+  shave() |>
+  rplot()
+```
+
+We observe that `carat`, and `x` to `z` are highly correlated, so some of them will be filtered by a `step_corr()` recipe.
+
+Let's see how the geometrical `x` variable relates with `log_price`.
+
+```{r}
+diamonds |>
+  ggplot(aes(x, log_price)) +
+  geom_point() +
+  geom_smooth() +
+  theme_minimal()
+```
+
+There are some diamonds of geometry zero.
+
+```{r}
+diamonds |>
+  filter(x == 0 | y == 0 | z == 0)
+```
+
+Let's see how `carat` works:
+
+```{r}
+diamonds |>
+  ggplot(aes(carat, log_price)) +
+  geom_point() +
+  geom_smooth() +
+  theme_minimal()
+```
+
+We observe a strong, nonlinear relationship between `carat` and `price`. `carat` can be a better feature than `x:z` variables, as it has no anomalous zero values, so we will skip them and keep `carat` as feature.
+
+# Predicting Diamond Prices
+
+Let's define the elements of a workflow to predict diamond prices.
+
+## Initial Split
+
+Performing an adequate split of the dataset into train and test sets. Keeping 90% of data for the training set.
+
+```{r}
+set.seed(44)
+d_split <- initial_split(diamonds, prop = 0.9)
+```
+
+## Preprocessing
+
+Some useful steps for preprocessing:
+
+Performing preprocessing steps in a recipe.
+
+```{r}
+d_rec <- recipe(log_price ~ ., training(d_split)) |>
+  update_role(price, new_role = "original predictor") |>
+  step_ordinalscore(all_nominal_predictors()) |>
+   step_rm(x:z) |>
+  step_sqrt(carat) |>
+  step_nzv(all_predictors())
+```
+
+*We can see the preprocessed dataset doing:*
+
+```{r}
+d_rec |>
+  prep() |>
+  bake(new_data = NULL)
+```
+
+*And we can see the roles of variables:*
+
+```{r}
+d_rec |>
+  prep() |> 
+  summary()
+```
+
+## Models
+
+Define=ing two predictive models:
+
+-   A **ensemble-based** model, like boosted trees.
+-   A **regression-based** model, like regularized regression.
+
+*I have chosen a regularized regression and a boosted tree model.*
+
+```{r}
+rr <- linear_reg(mode = "regression", engine = "glmnet", penalty = 0, mixture = 1)
+
+bt <- boost_tree(mode = "regression") |>
+  set_engine("xgboost")
+```
+
+*And the workflows:*
+
+```{r}
+d_rr_wf <- workflow() |>
+  add_recipe(d_rec) |>
+  add_model(rr)
+
+d_bt_wf <- workflow() |>
+  add_recipe(d_rec) |>
+  add_model(bt)
+```
+
+*Let's store both workflows into a list.*
+
+```{r}
+d_wf <- list(d_rr_wf, d_bt_wf)
+names(d_wf) <- c("reg_regression", "boosted_trees")
+```
+
+
+## Cross Validation
+
+Defining a set of ten folders for the training set, and testing the two models with cross validation using as metrics mean absolute error `mae`, root of mean squared errors `rmse` and r squared `rsq`.
+
+*The folds:*
+
+```{r}
+set.seed(11)
+folds <- vfold_cv(training(d_split), v = 10)
+```
+
+*The metrics:*
+
+```{r}
+reg_metrics <- metric_set(mae, rmse, rsq)
+```
+
+*Let's test the two models at the same time with `lapply()`.*
+
+```{r}
+d_cv <- lapply(d_wf, \(m) m |> fit_resamples(folds, metrics = reg_metrics) |> collect_metrics())
+```
+
+## Model Decision
+
+*Let's see the results:*
+
+```{r}
+d_cv
+```
+
+*We observe that the boosted trees model is the one that performs best.*
+
+# Final Model
+
+## Training the Model
+
+Training a model for diamond pricing on the whole training set.
+
+```{r}
+model <- d_bt_wf |>
+  fit(training(d_split)) 
+```
+
+## Performance of `log_price`
+
+Evaluating the performance of the model in the test set.
+
+```{r}
+model |>
+  predict(testing(d_split)) |>
+  bind_cols(testing(d_split)) |>
+  reg_metrics(truth = log_price, estimate = .pred)
+```
+
+*We can plot target versus prediction:*
+
+```{r}
+model |>
+  predict(testing(d_split)) |>
+  bind_cols(testing(d_split)) |>
+  ggplot(aes(log_price, .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  theme_minimal()
+```
+
+## Performance with `price`
+
+Evaluating the performance of the model on the test set using the original price variable and the exponential transformation of the prediction.
+
+*We need to obtain the real price using the reverse function of `log()` that is `exp()`.*
+
+```{r}
+model |>
+  predict(testing(d_split)) |>
+  bind_cols(testing(d_split)) |>
+  mutate(price_pred = exp(.pred)) |>
+  reg_metrics(truth = price, estimate = price_pred)
+```
+
+*The target versus prediction plot shows high variability in prediction for high prices.*
+
+```{r}
+model |>
+  predict(testing(d_split)) |>
+  bind_cols(testing(d_split)) |>
+  mutate(price_pred = exp(.pred)) |>
+  ggplot(aes(price, price_pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  theme_minimal()
+```
+
